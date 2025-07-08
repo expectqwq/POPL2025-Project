@@ -1,0 +1,171 @@
+;; ============================================================================
+;; 渐进函数式语言解释器测试用例集
+;; 展示从动态类型到静态类型的渐进式类型系统特征
+;; ============================================================================
+
+;; ============================================================================
+;; 测试1: 变量定义类型不匹配错误
+;; 展示变量定义时类型声明与实际值不匹配的情况
+;; ============================================================================
+
+(display "=== 测试1: 变量定义类型不匹配错误 ===")
+(newline)
+
+;; 正确的类型定义
+(define x : Int 42)
+(define name : String "Alice")
+(display "正确定义 x: ")
+(display x)
+(newline)
+
+;; 以下定义会产生类型错误
+;; 错误1: 整数赋值给字符串类型
+;; (define wrong-string : String 123)  ; 错误: Type mismatch in definition of wrong-string: expected String, got Int
+
+;; 错误2: 字符串赋值给整数类型
+;; (define wrong-int : Int "hello")    ; 错误: Type mismatch in definition of wrong-int: expected Int, got String
+
+;; ============================================================================
+;; 测试2:递归进行函数类型检查的示例
+;; 展示函数内参数与返回值的递归匹配
+;; ============================================================================
+
+(display "=== 测试2: 函数类型的递归检查 ===")
+(newline)
+
+(define add (lambda ((x : (Int -> Int)) (y : Int)) (x y)))
+(define func1 (lambda ((x : Int)) x))
+(define func2 (lambda ((x : String)) x))
+(define func3 : (Int -> String) (lambda ((x : Int)) "qwq"))
+
+(displayln "函数类型推断输出:")
+(displayln (type-of add))
+(displayln (type-of func1))
+(displayln (type-of func2))
+(displayln (type-of func3))
+
+(display "正确输出：")
+(add func1 1) ;; 正确，输出 1
+;;(add func2 1) ;; 错误： Type mismatch for parameter x: expected (Int -> Int), got (String -> ?)
+;;(add func3 1) ;; 错误： Type mismatch for parameter x: expected (Int -> Int), got (Int -> String)
+
+
+;; ============================================================================
+;; 测试3: Cast操作失败错误
+;; 展示类型转换失败的情况
+;; ============================================================================
+
+(display "=== 测试3: Cast操作失败错误 ===")
+(newline)
+
+;; 正确的Cast操作
+(define dynamic-val : ? 42)
+(define casted-val (cast dynamic-val ? Int))
+(display "正确的Cast操作: ")
+(display casted-val)
+(newline)
+
+;; 以下Cast操作会失败
+;; 错误1: 源类型不匹配
+;; (define wrong-cast (cast "hello" Int String))  ; 错误: Cast failed: value type doesn't match from-type
+
+;; ============================================================================
+;; 测试4: 联合类型边界错误
+;; 展示联合类型使用不当的错误情况
+;; ============================================================================
+
+(display "=== 测试4: 联合类型边界错误 ===")
+(newline)
+
+;; 正确的联合类型使用
+(define union-func : ((Union Int String) -> String)
+  (lambda ((x : (Union Int String)))
+    (cond
+      [(number? x) "number"]
+      [(string? x) "string"]
+      [else "unknown"])))
+
+(display "联合类型处理(Int): ")
+(display (union-func 42))
+(newline)
+(display "联合类型处理(String): ")
+(display (union-func "test"))
+(newline)
+
+;; 以下会产生类型错误
+;; 错误1: 传入不在联合类型中的类型
+;; (define restricted-union : ((Union Int String) -> String)
+;;   (lambda ((x : (Union Int String))) "result"))
+;; (restricted-union #t)  ; 错误: Bool不在Union Int String中
+
+;; ============================================================================
+;; 测试5: Let绑定中的类型错误
+;; 展示Let表达式中类型注解不匹配的错误
+;; ============================================================================
+
+(display "=== 测试5: Let绑定中的类型错误 ===")
+(newline)
+
+;; 正确的Let绑定
+(let ([(x : Int) 10]
+      [(y : String) "hello"])
+  (display "正确的Let绑定: ")
+  (display "x : ")
+  (display x)
+  (display ", y : ")
+  (display y)
+  (newline))
+
+;; 以下Let绑定会产生类型错误
+;; 错误1: Let绑定中类型不匹配
+;; (let ([(x : Int) "not-int"]
+;;       [(y : String) 123])
+;;   (list x y))  ; 错误: Type mismatch in let binding
+
+;; 错误2: Let*中类型依赖错误
+;; (let* ([(x : String) "hello"]
+;;        [(y : Int) (string-length x)]
+;;        [(z : String) (+ y 1)])  ; 错误: Type mismatch in let binding
+;;   (list x y z))
+
+;; ============================================================================
+;; 测试6: 高阶函数类型匹配错误
+;; 展示高阶函数中函数类型不匹配的错误
+;; ============================================================================
+
+(display "=== 测试6: 高阶函数类型匹配错误 ===")
+(newline)
+
+;; 定义map函数（简化版）
+(define simple-map : ((Int -> Int) (List Int) -> (List Int))
+  (lambda ((f : (Int -> Int)) (lst : (List Int)))
+    (if (null? lst)
+        '()
+        (cons (f (car lst)) (simple-map f (cdr lst))))))
+
+;; 正确使用
+(define double : (Int -> Int)
+  (lambda ((x : Int)) (* x 2)))
+
+(display "正确的map使用: ")
+(display (simple-map double (list 1 2 3)))
+(newline)
+
+;; 以下会产生类型错误
+;; 错误1: 传入错误的函数类型
+(define string-func : (String -> String)
+  (lambda ((s : String)) s))
+
+;; (simple-map string-func (list 1 2 3))  ; 错误: 函数类型不匹配
+
+;; 错误2: 传入错误的列表类型
+;; (simple-map double "qwq")  ; 错误: 参数类型不匹配
+
+;; ============================================================================
+;; 测试完成提示
+;; ============================================================================
+
+(display "=== 类型错误测试完成（注：错误用例已注释以防程序中断）===")
+(newline)
+(display "取消注释相应行可以观察具体的类型错误信息")
+(newline)

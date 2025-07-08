@@ -1,0 +1,763 @@
+#lang racket
+
+(require racket/match)
+(require racket/pretty)
+
+;; ============================================================================
+;; 类型定义
+;; ============================================================================
+
+;; 类型表示
+(struct type-int () #:transparent)
+(struct type-bool () #:transparent)
+(struct type-string () #:transparent)
+(struct type-number () #:transparent)
+(struct type-char () #:transparent)
+(struct type-unknown () #:transparent)
+(struct type-function (params return) #:transparent)
+(struct type-list (element) #:transparent)
+(struct type-pair (first second) #:transparent)
+(struct type-union (types) #:transparent)
+
+;; 值表示
+(struct closure (params body env) #:transparent)
+(struct typed-value (value type) #:transparent)
+
+;; 环境
+(struct environment (bindings parent) #:transparent)
+(define (make-env-box env) (box env))
+(define (env-box-ref env-box) (unbox env-box))
+(define (env-box-set! env-box new-env) (set-box! env-box new-env))
+(define (env-box-update! env-box update-fn)
+  (env-box-set! env-box (update-fn (env-box-ref env-box))))
+
+;; 错误类型
+(struct type-error (message) #:transparent)
+(struct runtime-error (message) #:transparent)
+
+;; ============================================================================
+;; 工具函数
+;; ============================================================================
+
+;; 创建空环境
+(define (empty-env)
+  (environment (hash) #f))
+
+;; 扩展环境
+(define (extend-env env var val)
+  (environment (hash-set (environment-bindings env) var val)
+               (environment-parent env)))
+
+;; 查找变量
+(define (lookup-env env var)
+  (let ([bindings (environment-bindings env)])
+    (cond
+      [(hash-has-key? bindings var)
+       (let ([val (hash-ref bindings var)])
+         (if (box? val) (unbox val) val))] ; 自动解开box
+      [(environment-parent env)
+       (lookup-env (environment-parent env) var)]
+      [else (error (format "Unbound variable: ~a" var))])))
+
+;; 打印环境
+(define (print-env env [indent 0])
+  (define (print-indent n)
+    (for ([i n]) (display " ")))
+  (when env
+    (print-indent indent)
+    (printf "Environment bindings:\n")
+    (hash-for-each (environment-bindings env)
+                   (lambda (var val)
+                     (print-indent (+ indent 2))
+                     (printf "~a: " var)
+                     (if (box? val)
+                         (printf "<box: ~a>" (unbox val))
+                         (pretty-print val))
+                     (newline)))
+    (when (environment-parent env)
+      (print-indent indent)
+      (printf "Parent environment:\n")
+      (print-env (environment-parent env) (+ indent 4)))))
+
+;; 类型相等性检查
+(define (type-equal? t1 t2)
+  (match (list t1 t2)
+    [(list (type-unknown) _) #t]
+    [(list _ (type-unknown)) #t]
+    [(list (type-int) (type-int)) #t]
+    [(list (type-bool) (type-bool)) #t]
+    [(list (type-string) (type-string)) #t]
+    [(list (type-number) (type-number)) #t]
+    [(list (type-char) (type-char)) #t]
+    [(list (type-function p1 r1) (type-function p2 r2))
+     (and (= (length p1) (length p2))
+          (andmap type-equal? p1 p2)
+          (type-equal? r1 r2))]
+    [(list (type-list e1) (type-list e2)) (type-equal? e1 e2)]
+    [(list (type-pair f1 s1) (type-pair f2 s2))
+     (and (type-equal? f1 f2) (type-equal? s1 s2))]
+    [(list (type-union ts1) (type-union ts2))
+     (and (= (length ts1) (length ts2))
+          (andmap (lambda (t) (ormap (lambda (u) (type-equal? t u)) ts2)) ts1))]
+    [else #f]))
+
+;; 类型兼容性检查(用于渐进式类型)
+(define (type-compatible? t1 t2)
+  (cond
+    ;; 完全相等或有未知类型
+    [(type-equal? t1 t2) #t]
+    [(type-unknown? t1) #t]
+    [(type-unknown? t2) #t]
+
+    ;; Int 可以兼容 Number
+    [(and (type-int? t1) (type-number? t2)) #t]
+    [(and (type-number? t1) (type-int? t2)) #t]
+
+    ;; 函数类型兼容性（允许返回值为 ?）
+    [(and (type-function? t1) (type-function? t2))
+     (let ([ps1 (type-function-params t1)]
+           [ps2 (type-function-params t2)]
+           [r1 (type-function-return t1)]
+           [r2 (type-function-return t2)])
+       (and (= (length ps1) (length ps2))
+            (andmap type-compatible? ps1 ps2)
+            (or (type-unknown? r1)
+                (type-unknown? r2)
+                (type-compatible? r1 r2))))]
+
+    ;; List 兼容性
+    [(and (type-list? t1) (type-list? t2))
+     (type-compatible? (type-list-element t1) (type-list-element t2))]
+
+    ;; Pair 兼容性
+    [(and (type-pair? t1) (type-pair? t2))
+     (and (type-compatible? (type-pair-first t1) (type-pair-first t2))
+          (type-compatible? (type-pair-second t1) (type-pair-second t2)))]
+
+    ;; Union 类型兼容性：t1 属于 t2 的联合类型 或 t2 属于 t1
+    [(type-union? t1)
+     (ormap (lambda (t) (type-compatible? t t2)) (type-union-types t1))]
+    [(type-union? t2)
+     (ormap (lambda (t) (type-compatible? t1 t)) (type-union-types t2))]
+
+    [else #f]))
+
+;; 推断值的类型
+(define (infer-type value)
+  (cond
+    [(integer? value) (type-int)]
+    [(boolean? value) (type-bool)]
+    [(string? value) (type-string)]
+    [(number? value) (type-number)]
+    [(char? value) (type-char)]
+    [(list? value) (type-list (type-unknown))]
+    [(pair? value) (type-pair (type-unknown) (type-unknown))]
+    [(closure? value)
+     (let* ([param-types (map (lambda (param-info)
+                                (match param-info
+                                  [(list _ ty) ty]
+                                  [_ (type-unknown)])) 
+                              (closure-params value))]
+            [ret-type (type-unknown)])
+       (type-function param-types ret-type))]
+    [else (type-unknown)]))
+
+;;得到类型对应的字符串
+(define (type->string t)
+  (match t
+    [(type-int) "Int"]
+    [(type-bool) "Bool"]
+    [(type-string) "String"]
+    [(type-number) "Number"]
+    [(type-char) "Char"]
+    [(type-unknown) "?"]
+    [(type-list elem) (format "(List ~a)" (type->string elem))]
+    [(type-pair fst snd) (format "(Pair ~a ~a)" (type->string fst) (type->string snd))]
+    [(type-union types) 
+     (format "(Union ~a)" (string-join (map type->string types) " "))]
+    [(type-function params return)
+     (format "(~a -> ~a)" 
+             (string-join (map type->string params) " ") 
+             (type->string return))]
+    [else (format "~a" t)]))
+
+;; ============================================================================
+;; 语法分析
+;; ============================================================================
+
+(define (type->sexpr t)
+  (match t
+    [(type-int) 'Int]
+    [(type-bool) 'Bool]
+    [(type-string) 'String]
+    [(type-number) 'Number]
+    [(type-char) 'Char]
+    [(type-unknown) '?]
+    [(type-list elem) `(List ,(type->sexpr elem))]
+    [(type-pair fst snd) `(Pair ,(type->sexpr fst) ,(type->sexpr snd))]
+    [(type-union ts) `(Union ,@(map type->sexpr ts))]
+    [(type-function ps r) `(,@(map type->sexpr ps) -> ,(type->sexpr r))]
+    [_ '?]))
+
+;; 解析类型表达式
+(define (parse-type expr)
+  (match expr
+    ['Int (type-int)]
+    ['Bool (type-bool)]
+    ['String (type-string)]
+    ['Number (type-number)]
+    ['Char (type-char)]
+    ['? (type-unknown)]
+    [`(List ,elem-type) (type-list (parse-type elem-type))]
+    [`(Pair ,first-type ,second-type) 
+     (type-pair (parse-type first-type) (parse-type second-type))]
+    [`(Union ,@types) (type-union (map parse-type types))]
+    [`(,@param-types -> ,return-type)
+     (type-function (map parse-type param-types) (parse-type return-type))]
+    [else (error (format "Invalid type expression: ~a" expr))]))
+
+;; 解析带类型的参数
+(define (parse-typed-param param)
+  (match param
+    [`(,var : ,type) (list var (parse-type type))]
+    [var (list var (type-unknown))]))
+
+(define (inject-lambda-param-types expr)
+  (match expr
+    [`(define ,name : ,type ,(and lam `(lambda ,params . ,body)))
+     ;; 只处理 lambda 形式的定义
+     (define parsed-type (parse-type type))
+     (match parsed-type
+       [(type-function outer-param-types outer-return-type)
+        ;; 向 lambda 递归注入类型
+        `(define ,name ,(inject-into-lambda lam parsed-type))] ; 注入类型
+       [_ expr])]
+
+    [`(: ,(and lam `(lambda ,params . ,body)) ,type)
+     (define parsed-type (parse-type type))
+     (match parsed-type
+       [(type-function param-types ret-type)
+        `(: ,(inject-into-lambda lam parsed-type) ,type)]
+       [_ expr])]
+
+    [else expr]))
+
+
+(define (inject-into-lambda lam ty)
+  (define (already-typed-param? p)
+    (match p
+      [`(,name : ,_) #t]
+      [_ #f]))
+
+  (match lam
+    [`(lambda ,params . ,body)
+     (match ty
+       [(type-function param-types ret-type)
+        ;; 注入参数类型
+        (define injected-params
+          (map (lambda (p param-ty)
+                 (if (already-typed-param? p)
+                     p
+                     `(,p : ,(type->sexpr param-ty))))
+               params param-types))
+
+        ;; 递归注入内层 lambda
+        (define injected-body
+          (if (and (= (length body) 1)
+                   (match (car body) [`(lambda ,_ . ,_) #t] [_ #f])
+                   (type-function? ret-type))
+              (list (inject-into-lambda (car body) ret-type))
+              body))
+
+        `(lambda ,injected-params . ,injected-body)]
+       [_ lam])] ; 类型不是函数类型时不变
+    [_ lam])) ; 不是 lambda 直接返回
+
+(define (infer-expr-type expr closure-env param-types)
+  (match expr
+    ;; 1. 文字常量
+    [(? integer?) (type-int)]
+    [(? boolean?) (type-bool)]
+    [(? string?)  (type-string)]
+    [(? char?)    (type-char)]
+    [(? symbol?) ; 变量引用
+     (hash-ref param-types expr #f)]
+
+    ;; 2. 加法：Int+Int -> Int；Number参与则 Number
+    [`(+ ,e1 ,e2)
+     (let ([t1 (or (hash-ref param-types e1 #f)
+                   (infer-expr-type e1 closure-env param-types))]
+           [t2 (or (hash-ref param-types e2 #f)
+                   (infer-expr-type e2 closure-env param-types))])
+       (cond
+         [(and (type-int?    t1) (type-int?    t2)) (type-int)]
+         [(and (or (type-int?    t1) (type-number? t1))
+               (or (type-int?    t2) (type-number? t2)))
+          (type-number)]
+         [else #f]))]
+
+    ;; 3. 减法：同加法
+    [`(- ,e1 ,e2)
+     (let ([t1 (or (hash-ref param-types e1 #f)
+                   (infer-expr-type e1 closure-env param-types))]
+           [t2 (or (hash-ref param-types e2 #f)
+                   (infer-expr-type e2 closure-env param-types))])
+       (cond
+         [(and (type-int?    t1) (type-int?    t2)) (type-int)]
+         [(and (or (type-int?    t1) (type-number? t1))
+               (or (type-int?    t2) (type-number? t2)))
+          (type-number)]
+         [else #f]))]
+
+    ;; 4. 乘法：Int*Int -> Int；任何 Number 参与 -> Number
+    [`(* ,e1 ,e2)
+     (let ([t1 (or (hash-ref param-types e1 #f)
+                   (infer-expr-type e1 closure-env param-types))]
+           [t2 (or (hash-ref param-types e2 #f)
+                   (infer-expr-type e2 closure-env param-types))])
+       (cond
+         [(and (type-int?    t1) (type-int?    t2)) (type-int)]
+         [(and (or (type-int?    t1) (type-number? t1))
+               (or (type-int?    t2) (type-number? t2)))
+          (type-number)]
+         [else #f]))]
+
+    ;; 5. 除法：总是产生 Number（即使整除也当 Number）
+    [`(/ ,e1 ,e2)
+     (let ([t1 (or (hash-ref param-types e1 #f)
+                   (infer-expr-type e1 closure-env param-types))]
+           [t2 (or (hash-ref param-types e2 #f)
+                   (infer-expr-type e2 closure-env param-types))])
+       (if (and (or (type-int?    t1) (type-number? t1))
+                (or (type-int?    t2) (type-number? t2)))
+           (type-number)
+           #f))]
+
+    ;; 6. 其它
+    [_ #f]))
+
+;; ============================================================================
+;; 求值器
+;; ============================================================================
+
+
+;; 主求值函数 - 接受环境盒子
+(define (eval-expr expr env-box)
+  (match expr
+    ;; 字面量
+    [`(void) (void)]
+    [(? number?) expr]
+    [(? boolean?) expr]
+    [(? string?) expr]
+    [(? char?) expr]
+    
+    ;; 变量 - 从环境盒子中查找
+    [(? symbol? var)
+     (lookup-env (unbox env-box) var)]
+    
+    ;; 类型注解 (: expr type)
+    [`(: ,e ,type-expr)
+     (let ([value (eval-expr e env-box)]
+           [expected-type (parse-type type-expr)])
+       (if (type-compatible? (infer-type value) expected-type)
+           (typed-value value expected-type)
+           (error (format "Type mismatch: expected ~a, got ~a" 
+                         expected-type (infer-type value)))))]
+    
+    ;; 内联类型注解 expr :: type
+    [`(:: ,e ,type-expr)
+     (eval-expr `(: ,e ,type-expr) env-box)]
+    
+    ;; Lambda表达式 - 捕获当前环境值
+    [`(lambda ,params . ,body)
+     (let* ([parsed-params (map parse-typed-param params)]
+            [captured-env (unbox env-box)]
+            [ret-type (type-unknown)] ; 暂不推断返回类型
+            [param-types (map cadr parsed-params)] ; 提取类型
+            [typed-fn-type (type-function param-types ret-type)]
+            [c (closure parsed-params body captured-env)])
+       (typed-value c typed-fn-type))] ; 包上类型
+    
+    ;; 变量定义 - 更新环境盒子
+    [`(define ,var ,value)
+     (let* ([value-box (box '*uninitialized*)] ; 创建占位盒子
+            [temp-env (extend-env (unbox env-box) var value-box)] ; 临时扩展环境
+            [env-box-temp (box temp-env)]) ; 临时环境盒子
+       (set-box! env-box temp-env) ; 更新全局环境
+       (let ([val (eval-expr value env-box-temp)]) ; 在临时环境中求值
+         (set-box! value-box val) ; 设置实际值
+         (void)))] ; 定义表达式返回void
+    
+    [`(define ,var : ,type-expr ,value)
+     (let* ([expected-type (parse-type type-expr)]
+            [value-box (box '*uninitialized*)]
+            [temp-env (extend-env (unbox env-box) var value-box)]
+            [env-box-temp (box temp-env)]
+            [patched-value
+             (if (and (pair? value) (equal? (car value) 'lambda))
+                 (inject-into-lambda value expected-type)
+                 value)]
+            [val (eval-expr patched-value env-box-temp)]
+            [raw-val (if (typed-value? val) (typed-value-value val) val)]
+            [actual-type (if (typed-value? val)
+                             (typed-value-type val)
+                             (infer-type val))])
+
+       (define new-ret
+         (if (and (type-function? expected-type)
+                  (type-unknown? (type-function-return expected-type)))
+             (let* ([cl (typed-value-value val)]
+                    [params (closure-params cl)]
+                    [body   (closure-body cl)]
+                    [pmap   (for/hash ([p params])
+                              (values (car p) (cadr p)))])
+               (and (list? body)
+                    (= 1 (length body))
+                    (infer-expr-type (car body)
+                                     (closure-env cl)
+                                     pmap)))
+             #f))
+
+       (define final-type
+         (if (and new-ret (type-function? expected-type))
+             (type-function (type-function-params expected-type) new-ret)
+             expected-type))
+
+       (if (type-compatible? actual-type expected-type)
+           (begin
+             (set-box! value-box (typed-value raw-val final-type))
+             (set-box! env-box temp-env)
+             (void))
+           (error (format "Type mismatch in definition of ~a: expected ~a, got ~a"
+                          var (type->string expected-type) (type->string actual-type)))))]
+    
+        ;; 条件表达式
+        [`(if ,condition ,then-expr ,else-expr)
+         (let ([cond-val (eval-expr condition env-box)])
+           (if (get-boolean-value cond-val)
+               (eval-expr then-expr env-box)
+               (eval-expr else-expr env-box)))]
+    
+    ;; Let绑定
+    [`(let ,bindings . ,body)
+     (let ([new-env (extend-let-bindings bindings (unbox env-box))])
+       (eval-sequence body (box new-env)))] ; 创建新的环境盒子
+    
+    ;; Let*绑定(顺序绑定)
+    [`(let* ,bindings . ,body)
+     (let ([new-env (extend-let*-bindings bindings (unbox env-box))])
+       (eval-sequence body (box new-env)))] ; 创建新的环境盒子
+    
+    ;; Cond表达式
+    [`(cond . ,clauses)
+     (eval-cond clauses env-box)]
+    
+    ;; 列表构造
+    [`(list . ,elements)
+     (map (lambda (elem) (eval-expr elem env-box)) elements)]
+    
+    ;; 配对构造
+    [`(cons ,first ,second)
+     (cons (eval-expr first env-box) (eval-expr second env-box))]
+    
+    ;; 引用
+    [`(quote ,expr) expr]
+    [`',expr expr]
+    
+    ;; Cast表达式
+    [`(cast ,e ,from-type ,to-type)
+     (eval-cast e from-type to-type env-box)]
+    
+    ;; 类型检查
+    [`(type-of ,e)
+     (let ([v (eval-expr e env-box)])
+       (type->string
+        (if (typed-value? v)
+            (typed-value-type v)
+            (infer-type v))))]
+    
+    [`(is-type? ,e ,type-expr)
+     (let ([value (eval-expr e env-box)]
+           [expected-type (parse-type type-expr)])
+       (type-compatible? (infer-type value) expected-type))]
+
+    ;; 函数调用
+    [(? list? expr) (eval-builtin expr env-box)] ; 传递环境盒子
+    
+    ;; 其他表达式
+    [else (error (format "Unknown expression: ~a" expr))]))
+
+;; 应用函数
+(define (apply-function func args env-box)
+  (define real-func
+    (if (typed-value? func)
+        (typed-value-value func)
+        func))
+  (match real-func
+    [(closure params body closure-env)
+     ;; 类型检查参数
+     (define param-types
+       (if (typed-value? func)
+           (match (typed-value-type func)
+             [(type-function ps _) ps]
+             [_ (map (lambda (_) (type-unknown)) params)])
+           (map (lambda (_) (type-unknown)) params)))
+
+     ;; 扩展环境（传入类型检查）
+     (let* ([param-specs (map (lambda (p t) (list (car p) t)) params param-types)]
+            [new-env (extend-closure-env param-specs args closure-env)]
+            [local-env-box (make-env-box new-env)])
+       (eval-sequence body local-env-box))]
+    [else (error "Cannot apply non-function")]))
+
+;; 扩展闭包环境
+(define (extend-closure-env params args env)
+  (foldl (lambda (param-info arg acc-env)
+           (match param-info
+             [(list var expected-type)
+              (let ([arg-val (if (typed-value? arg) (typed-value-value arg) arg)]
+                    [arg-type (if (typed-value? arg) (typed-value-type arg) (infer-type arg))])
+                (if (type-compatible? arg-type expected-type)
+                    (extend-env acc-env var arg-val)
+                    (error (format "Type mismatch for parameter ~a: expected ~a, got ~a"
+                                   var
+                                   (type->string expected-type)
+                                   (type->string arg-type)))))]))
+         env params args))
+
+;; 扩展let绑定环境
+(define (extend-let-bindings bindings env)
+  (foldl
+   (lambda (binding acc-env)
+     (match binding
+       ;; 解析带类型注解的绑定
+       [`((,var : ,type-expr) ,value)
+        (let* ([val (eval-expr value (box env))]
+               [expected-type (parse-type type-expr)])
+          (if (type-compatible? (infer-type val) expected-type)
+              (let ([new-env (extend-env acc-env var (typed-value val expected-type))])
+                new-env)
+              (error (format "Type mismatch in let binding for ~a" var))))]
+       ;; 解析无类型注解的绑定
+       [`(,var ,value)
+        (let ([val (eval-expr value (box env))])
+          (extend-env acc-env var val))]))
+   env bindings))
+
+;; let*的模式匹配
+(define (extend-let*-bindings bindings env)
+  (foldl (lambda (binding acc-env)
+           (match binding
+             [`((,var : ,type-expr) ,value)
+              (let ([val (eval-expr value (box acc-env))]
+                    [expected-type (parse-type type-expr)])
+                (if (type-compatible? (infer-type val) expected-type)
+                    (extend-env acc-env var (typed-value val expected-type))
+                    (error (format "Type mismatch in let* binding for ~a" var))))]
+             [`(,var ,value)
+              (extend-env acc-env var (eval-expr value (box acc-env)))]))
+         env bindings))
+
+;; 求值序列
+(define (eval-sequence exprs env-box)
+  (if (null? exprs)
+      (void)
+      (let loop ([rest (cdr exprs)]
+                [current (car exprs)])
+        (let ([result (eval-expr current env-box)])
+          (if (null? rest)
+              result
+              (loop (cdr rest) (car rest)))))))
+
+;; 求值cond
+(define (eval-cond clauses env)
+  (cond
+    [(null? clauses) (error "No matching cond clause")]
+    [else
+     (let ([clause (car clauses)])
+       (match clause
+         [`[else ,expr] (eval-expr expr env)]
+         [`[,condition ,expr]
+          (if (get-boolean-value (eval-expr condition env))
+              (eval-expr expr env)
+              (eval-cond (cdr clauses) env))]))]))
+
+;; Cast求值
+(define (eval-cast expr from-type to-type env)
+  (let* ([v (eval-expr expr env)]
+         [raw (if (typed-value? v) (typed-value-value v) v)]
+         [actual-type (if (typed-value? v)
+                          (typed-value-type v)
+                          (infer-type v))]
+         [from-t (parse-type from-type)]
+         [to-t (parse-type to-type)])
+    (if (type-compatible? actual-type from-t)
+        (typed-value raw to-t)
+        (error (format "Cast failed: value type doesn't match from-type")))))
+
+;; 获取布尔值
+(define (get-boolean-value val)
+  (cond
+    [(typed-value? val) (get-boolean-value (typed-value-value val))]
+    [(boolean? val) val]
+    [else #f]))
+
+;; ============================================================================
+;; 内置函数
+;; ============================================================================
+
+;; 取出有类型变量的值
+(define (unwrap v)
+  (if (typed-value? v)
+      (typed-value-value v)
+      v))
+
+;; 求值内置函数
+(define (eval-builtin expr env)
+  (match expr
+    ;; 算术运算
+    [`(+ ,x ,y) (+ (unwrap (eval-expr x env)) (unwrap (eval-expr y env)))]
+    [`(- ,x ,y) (- (unwrap (eval-expr x env)) (unwrap (eval-expr y env)))]
+    [`(* ,x ,y) (* (unwrap (eval-expr x env)) (unwrap (eval-expr y env)))]
+    [`(/ ,x ,y) 
+     (let ([divisor (unwrap (eval-expr y env))])
+       (if (= divisor 0)
+           (error "Division by zero")
+           (/ (unwrap (eval-expr x env)) divisor)))]
+    [`(quotient ,x ,y) 
+     (let ([a (unwrap (eval-expr x env))]
+           [b (unwrap (eval-expr y env))])
+       (if (= b 0)
+           (error "Division by zero")
+           (quotient a b)))]
+
+    [`(modulo ,x ,y)
+     (let ([a (unwrap (eval-expr x env))]
+           [b (unwrap (eval-expr y env))])
+       (if (= b 0)
+           (error "Division by zero")
+           (modulo a b)))]
+    
+    ;; 比较运算
+    [`(= ,x ,y) (= (unwrap (eval-expr x env)) (unwrap (eval-expr y env)))]
+    [`(< ,x ,y) (< (unwrap (eval-expr x env)) (unwrap (eval-expr y env)))]
+    [`(> ,x ,y) (> (unwrap (eval-expr x env)) (unwrap (eval-expr y env)))]
+    [`(<= ,x ,y) (<= (unwrap (eval-expr x env)) (unwrap (eval-expr y env)))]
+    [`(>= ,x ,y) (>= (unwrap (eval-expr x env)) (unwrap (eval-expr y env)))]
+
+    ;; 逻辑运算
+    [`(and ,x ,y) (and (get-boolean-value (eval-expr x env)) 
+                       (get-boolean-value (eval-expr y env)))]
+    [`(or ,x ,y) (or (get-boolean-value (eval-expr x env)) 
+                     (get-boolean-value (eval-expr y env)))]
+    [`(not ,x) (not (get-boolean-value (eval-expr x env)))]
+
+    ;; 字符串操作
+    [`(string-append ,s1 ,s2) 
+     (string-append (unwrap (eval-expr s1 env)) (unwrap (eval-expr s2 env)))]
+    [`(string-length ,s) (string-length (unwrap (eval-expr s env)))]
+    [`(substring ,s ,start ,end) 
+     (substring (unwrap (eval-expr s env)) 
+                (unwrap (eval-expr start env)) 
+                (unwrap (eval-expr end env)))]
+    [`(string=? ,s1 ,s2) 
+     (string=? (unwrap (eval-expr s1 env)) (unwrap (eval-expr s2 env)))]
+
+    ;; 列表操作
+    [`(car ,lst) 
+     (let ([l (unwrap (eval-expr lst env))])
+       (if (pair? l) (car l) (error "car: not a pair")))]
+    [`(cdr ,lst) 
+     (let ([l (unwrap (eval-expr lst env))])
+       (if (pair? l) (cdr l) (error "cdr: not a pair")))]
+    [`(null? ,lst) (null? (unwrap (eval-expr lst env)))]
+    [`(length ,lst) (length (unwrap (eval-expr lst env)))]
+    [`(append ,l1 ,l2) 
+     (append (unwrap (eval-expr l1 env)) (unwrap (eval-expr l2 env)))]
+
+    ;; 类型谓词
+    [`(number? ,x) (number? (unwrap (eval-expr x env)))]
+    [`(string? ,x) (string? (unwrap (eval-expr x env)))]
+    [`(boolean? ,x) (boolean? (unwrap (eval-expr x env)))]
+    [`(list? ,x) (list? (unwrap (eval-expr x env)))]
+    [`(pair? ,x) (pair? (unwrap (eval-expr x env)))]
+    [`(procedure? ,x) (closure? (unwrap (eval-expr x env)))]
+
+    ;; 错误和显示
+    [`(error ,msg) (error (unwrap (eval-expr msg env)))]
+    [`(display ,x) (display (unwrap (eval-expr x env))) (void)]
+    [`(displayln ,x) (displayln (unwrap (eval-expr x env))) (void)]
+    [`(newline) (newline)]
+
+    ;; 函数调用
+    [else
+     (let ([func (eval-expr (car expr) env)]
+           [args (cdr expr)])
+       (apply-function func 
+                       (map (lambda (arg) (eval-expr arg env)) args)
+                       env))]))
+
+;; ============================================================================
+;; 解释器主函数
+;; ============================================================================
+
+;; 运行程序
+(define (run-program program)
+  (let ([global-env-box (make-env-box (empty-env))])
+    (for ([expr program])
+      (with-handlers ([exn:fail?
+                       (lambda (e)
+                         (displayln (exn-message e))
+                         (exit 1))])
+        ;; 注入 lambda 参数类型（仅在 define 带类型的 lambda 中注入）
+        (define typed-expr
+          (match expr
+            [`(define ,var : ,ty ,val)
+             (if (and (pair? val) (equal? (car val) 'lambda))
+                 ;; 注入参数类型，保留类型信息
+                 (let* ([type-obj (parse-type ty)]
+                        [injected-lam (inject-into-lambda val type-obj)])
+                   `(define ,var : ,ty ,injected-lam))
+                 expr)]
+            [_ expr]))
+
+        ;; 执行
+        (let ([result (eval-expr typed-expr global-env-box)])
+          (when (not (void? result))
+            (pretty-print result)))))))
+
+;; 从文件读取并运行程序
+(define (run-file filename)
+  (let ([program (file->list filename)])
+    (run-program program)))
+
+;; 读取文件为列表
+(define (file->list filename)
+  (call-with-input-file filename
+    (lambda (port)
+      (let loop ([exprs '()])
+        (let ([expr (read port)])
+          (if (eof-object? expr)
+              (reverse exprs)
+              (loop (cons expr exprs))))))))
+
+;; ============================================================================
+;; 主程序入口
+;; ============================================================================
+
+(define (main args)
+  (cond
+    [(null? args) 
+     (displayln "Usage: racket compiler.rkt <filename>")]
+    [else
+     (let ([filename (car args)])
+       (if (file-exists? filename)
+           (run-file filename)
+           (displayln (format "File not found: ~a" filename))))]))
+
+;; 如果作为脚本运行
+(when (not (null? (current-command-line-arguments)))
+  (main (vector->list (current-command-line-arguments))))
+
+;; 导出主要函数供其他模块使用
+(provide run-program run-file eval-expr empty-env)

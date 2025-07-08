@@ -1,0 +1,434 @@
+;; ============================================================================
+;; 渐进函数式语言解释器测试用例集（正确使用方法）
+;; 展示从动态类型到静态类型的渐进式类型系统特征
+;; ============================================================================
+
+;; ============================================================================
+;; 测试1: 基础渐进式类型转换
+;; 展示Unknown类型与其他类型的兼容性
+;; ============================================================================
+
+(display "=== 测试1: 基础类型兼容性 ===")
+(newline)
+
+;; 1.1 动态到静态的渐进转换
+(define x : ? 42)                    ; x是unknown类型
+(define y : Int 10)                  ; y是静态Int类型
+(define z (+ x y))                   ; unknown与Int兼容，运算成功
+(display "动态+静态运算结果: ")
+(display z)
+(newline)
+
+;; 1.2 类型注解的渐进应用
+(define process-value
+  (lambda ((val : ?))                  ; 参数是unknown类型
+    (if (number? val)
+        (+ val 1)                    ; 运行时类型检查后安全运算
+        val)))
+
+(display "处理数字: ")
+(display (process-value 100))
+(newline)
+(display "处理字符串: ")
+(display (process-value "hello"))
+(newline)
+
+;; ============================================================================
+;; 测试2: 函数类型的渐进式演进
+;; 展示同一函数从动态到静态的重构过程
+;; ============================================================================
+
+(display "=== 测试2: 函数类型演进 ===")
+(newline)
+
+;; 2.1 完全动态版本
+(define calc-v1
+  (lambda (op x y)
+    (cond
+      [(string=? op "+") (+ x y)]
+      [(string=? op "*") (* x y)]
+      [(string=? op "max") (if (> x y) x y)]
+      [else (error "Unknown operator")])))
+
+;; 2.2 部分类型注解版本
+(define calc-v2
+  (lambda ((op : String) x y)        ; 操作符明确为String
+    (cond
+      [(string=? op "+") (+ x y)]
+      [(string=? op "*") (* x y)]
+      [(string=? op "max") (if (> x y) x y)]
+      [else (error "Unknown operator")])))
+
+;; 2.3 完全静态版本
+(define calc-v3 : (String Number Number -> Number)
+  (lambda ((op : String) (x : Number) (y : Number))
+    (cond
+      [(string=? op "+") (+ x y)]
+      [(string=? op "*") (* x y)]
+      [(string=? op "max") (if (> x y) x y)]
+      [else (error "Unknown operator")])))
+
+;; 测试三个版本
+(display "动态版本: ")
+(display (calc-v1 "+" 10 20))
+(newline)
+(display "部分类型版本: ")
+(display (calc-v2 "*" 5 6))
+(newline)
+(display "静态版本: ")
+(display (calc-v3 "max" 15 8))
+(newline)
+
+;; ============================================================================
+;; 测试3: 复杂数据结构的渐进式类型处理
+;; 展示列表、配对等复合类型的类型演进
+;; ============================================================================
+
+(display "=== 测试3: 复合数据类型处理 ===")
+(newline)
+
+(define map
+  (lambda (f lst)
+    (if (null? lst)
+        '()
+        (cons (f (car lst)) (map f (cdr lst))))))
+
+;; 3.1 动态列表处理
+(define process-list-v1
+  (lambda (lst)
+    (map (lambda (item)
+           (cond
+             [(number? item) (* item 2)]
+             [(string? item) (string-append item "!")]
+             [else item]))
+         lst)))
+
+;; 3.2 带类型约束的列表处理
+(define process-list-v2
+  (lambda ((lst : (List ?)))         ; 明确是列表，但元素类型未知
+    (map (lambda ((item : ?))
+           (cond
+             [(number? item) (* item 2)]
+             [(string? item) (string-append item "!")]
+             [else item]))
+         lst)))
+
+;; 3.3 联合类型版本
+(define process-list-v3 : ((List (Union Number String)) -> (List (Union Number String)))
+  (lambda ((lst : (List (Union Number String))))
+    (map (lambda ((item : (Union Number String)))
+           (cond
+             [(number? item) (* item 2)]
+             [(string? item) (string-append item "!")]
+             [else item]))  ; 这行在静态类型版本中不会到达
+         lst)))
+
+;; 测试复合数据处理
+(define test-data (list 1 "hello" 2 "world" 3))
+(display "动态列表处理: ")
+(display (process-list-v1 test-data))
+(newline)
+(display "类型约束版本: ")
+(display (process-list-v2 test-data))
+(newline)
+
+;; ============================================================================
+;; 测试4: 类型Cast和运行时检查
+;; 展示渐进式类型系统的类型转换能力
+;; ============================================================================
+
+(display "=== 测试4: 类型转换和检查 ===")
+(newline)
+
+;; 4.1 安全的类型转换
+(define safe-divide
+  (lambda (x y)
+    (let ([num-x (cast x ? Number)]   ; 将unknown转换为Number
+          [num-y (cast y ? Number)])
+      (if (= num-y 0)
+          (error "Division by zero")
+          (/ num-x num-y)))))
+
+;; 4.2 带类型检查的函数
+(define type-aware-processor
+  (lambda ((input : ?))
+    (cond
+      [(is-type? input Int)
+       (: (* input input) Int)]       ; 明确结果类型
+      [(is-type? input String)
+       (: (string-append input " processed") String)]
+      [else (: input ?)])))           ; 保持unknown
+
+;; 测试类型转换
+(display "安全除法: ")
+(display (safe-divide 10 3))
+(newline)
+(display "类型感知处理(整数): ")
+(display (type-aware-processor 5))
+(newline)
+(display "类型感知处理(字符串): ")
+(display (type-aware-processor "test"))
+(newline)
+
+;; ============================================================================
+;; 测试5: 渐进式重构演示
+;; 展示实际项目中从动态到静态的迁移过程
+;; ============================================================================
+
+(display "=== 测试5: 渐进式重构演示 ===")
+(newline)
+
+;; 5.1 初始动态版本 - 学生成绩管理系统
+(define student-system-v1
+  (lambda ()
+    (let ([students (list 
+                     (list "Alice" 85 92 78)
+                     (list "Bob" 90 88 95)
+                     (list "Charlie" 82 85 80))])
+      
+      (define calculate-average
+        (lambda (scores)
+          (/ (+ (car scores) (+ (car (cdr scores)) (car (cdr (cdr scores))))) 3)))
+      
+      (define get-grade
+        (lambda (avg)
+          (cond
+            [(>= avg 90) "A"]
+            [(>= avg 80) "B"]
+            [(>= avg 70) "C"]
+            [else "F"])))
+      
+      (map (lambda (student)
+             (let ([name (car student)]
+                   [scores (cdr student)])
+               (let ([avg (calculate-average scores)])
+                 (list name avg (get-grade avg)))))
+           students))))
+
+;; 5.2 部分类型化版本
+(define student-system-v2
+  (lambda ()
+    (let [((students : (List (List ?))) 
+           (list 
+             (list "Alice" 85 92 78)
+             (list "Bob" 90 88 95)
+             (list "Charlie" 82 85 80)))]
+
+      (define calculate-average
+        (lambda (scores)
+          (/ (+ (car scores)
+                (+ (car (cdr scores)) 
+                   (car (cdr (cdr scores))))) 3)))
+
+      (define get-grade : (Number -> String)
+        (lambda ((avg : Number))
+          (cond
+            [(>= avg 90) "A"]
+            [(>= avg 80) "B"]
+            [(>= avg 70) "C"]
+            [else "F"])))
+
+      (map (lambda ((student : (List ?)))
+             (let ([name (car student)]
+                   [scores (cdr student)])
+               (let ([avg (calculate-average scores)])
+                 (list name avg (get-grade avg)))))
+           students))))
+
+;; 测试重构版本
+(display "动态版本结果: ")
+(display (student-system-v1))
+(newline)
+(display "部分类型化版本结果: ")
+(display (student-system-v2))
+(newline)
+
+;; ============================================================================
+;; 测试6: 错误处理和类型安全演示
+;; 展示类型系统如何捕获常见错误
+;; ============================================================================
+
+(display "=== 测试6: 类型安全演示 ===")
+(newline)
+
+;; 支持任意非负整数的 number->string（仅正整数）
+(define number->string : (Number -> String)
+  (lambda ((n : Number))
+    (if (< n 10)
+        ;; 1位数
+        (cond
+          [(= n 0) "0"]
+          [(= n 1) "1"]
+          [(= n 2) "2"]
+          [(= n 3) "3"]
+          [(= n 4) "4"]
+          [(= n 5) "5"]
+          [(= n 6) "6"]
+          [(= n 7) "7"]
+          [(= n 8) "8"]
+          [(= n 9) "9"]
+          [else (error "Invalid digit")])
+        ;; 多位数：递归处理
+        (string-append 
+         (number->string (quotient n 10)) 
+         (number->string (modulo n 10))))))
+
+;; 6.1 正确的类型使用
+(define safe-string-ops
+  (lambda ((s : String) (n : Int))
+    (string-append s (number->string n))))
+
+(display "安全字符串操作: ")
+(display (safe-string-ops "Count: " 42))
+(newline)
+
+;; 6.2 演示类型兼容性
+(define flexible-add
+  (lambda ((x : ?) (y : ?))              ; 两个unknown参数
+    (if (and (number? x) (number? y))
+        (+ x y)
+        (error "Both arguments must be numbers"))))
+
+(display "灵活加法(正确): ")
+(display (flexible-add 10 20))
+(newline)
+
+;; 6.3 高阶函数的类型演进
+(define apply-twice-v1
+  (lambda (f x)
+    (f (f x))))
+
+(define apply-twice-v2 : ((? -> ?) ? -> ?)
+  (lambda ((f : (? -> ?)) (x : ?))
+    (f (f x))))
+
+(define increment : (Int -> Int)
+  (lambda ((n : Int)) (+ n 1)))
+
+(display "高阶函数应用: ")
+(display (apply-twice-v2 increment 5))
+(newline)
+
+;; ============================================================================
+;; 测试7: 类型推导和兼容性边界测试
+;; 展示类型系统的边界和限制
+;; ============================================================================
+
+(display "=== 测试7: 类型边界测试 ===")
+(newline)
+
+;; 7.1 类型推导演示
+(define inferred-types
+  (lambda ()
+    (let ([a 42]                     ; 推导为Int
+          [b "hello"]                ; 推导为String
+          [c (list 1 2 3)]           ; 推导为(List ?) (不进行递归类型推导)
+          [d (lambda (x) (+ x 1))])  ; 推导为(? -> ?) (不进行递归类型推导)
+      (list 
+        (type-of a)
+        (type-of b)
+        (type-of c)
+        (type-of d)))))
+
+(display "类型推导结果: ")
+(display (inferred-types))
+(newline)
+
+;; 7.2 联合类型处理
+(define handle-union-type
+  (lambda ((value : (Union Int String Bool)))
+    (cond
+      [(number? value) (+ value 100)]
+      [(string? value) (string-length value)]
+      [(boolean? value) (if value 1 0)]
+      [else (error "Unexpected type")])))
+
+(display "联合类型处理(Int): ")
+(display (handle-union-type 42))
+(newline)
+(display "联合类型处理(String): ")
+(display (handle-union-type "test"))
+(newline)
+(display "联合类型处理(Bool): ")
+(display (handle-union-type #t))
+(newline)
+
+;; ============================================================================
+;; 测试8: 实际应用场景 - 配置文件处理器
+;; 展示渐进式类型在实际应用中的价值
+;; ============================================================================
+
+(display "=== 测试8: 配置文件处理器 ===")
+(newline)
+
+;; 8.1 动态配置处理
+(define process-config-v1
+  (lambda (config)
+    (let ([host (car config)]
+          [port (car (cdr config))]
+          [ssl (car (cdr (cdr config)))])
+      (string-append 
+        (string-append 
+          (string-append 
+            (string-append "Server: " host)
+            ":")
+          (number->string port))
+        (if ssl " (SSL)" " (No SSL)")))))
+
+;; 8.2 类型安全的配置处理
+(define process-config-v2
+  (lambda ((config : (List ?)))
+    (let ([host (cast (car config) ? String)]
+          [port (cast (car (cdr config)) ? Int)]
+          [ssl (cast (car (cdr (cdr config))) ? Bool)])
+      (string-append 
+        (string-append 
+          (string-append 
+            (string-append "Server: " host)
+            ":")
+          (number->string port))
+        (if ssl " (SSL)" " (No SSL)")))))
+
+;; 测试配置处理
+(define test-config (list "localhost" 8080 #t))
+(display "动态配置处理: ")
+(display (process-config-v1 test-config))
+(newline)
+(display "类型安全配置处理: ")
+(display (process-config-v2 test-config))
+(newline)
+
+;; ============================================================================
+;; 测试9: 简单类型推断
+;; ============================================================================
+(display "=== 测试9: 简单类型推断 ===") (newline)
+
+;; 返回常量
+(define const1 : (Int Int -> ?) (lambda (x y) "qwq"))
+(display "const1: ") (displayln (type-of const1)) ; (Int Int -> String)
+
+;; 加法
+(define add1 : (Int Int -> ?) (lambda (x y) (+ x y)))
+(display "add1: ") (displayln (type-of add1)) ; (Int Int -> Int)
+
+;; 加常量
+(define add2 : (Int Int -> ?) (lambda (x y) (+ x 10)))
+(display "add2: ") (displayln (type-of add2)) ; (Int Int -> Int)
+
+;; 组合表达式
+(define comp1 : (Int Int -> ?) (lambda (x y) (+ (- x y) (* x y))))
+(display "comp1: ") (displayln (type-of comp1)) ; (Int Int -> Int)
+
+;; 除法（会推为 Number）
+(define div1 : (Int Int -> ?) (lambda (x y) (/ x y)))
+(display "div1: ") (displayln (type-of div1)) ; (Int Int -> Number)
+
+;; 混合加除
+(define mix1 : (Int Int -> ?) (lambda (x y) (+ (/ x y) 1)))
+(display "mix1: ") (displayln (type-of mix1)) ; (Int Int -> Number)
+
+;; ============================================================================
+;; 测试完成提示
+;; ============================================================================
+
+(display "=== 测试完成 ===")
